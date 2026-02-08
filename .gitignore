@@ -1,0 +1,13 @@
+# Ignore the archive folder
+archive/
+
+# Standard Python ignores
+__pycache__/
+*.pyc
+.streamlit/
+*.pkl
+*.png
+dataset/
+examples/
+new_dataset/
+templates/
