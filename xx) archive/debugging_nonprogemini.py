@@ -1,108 +1,106 @@
+import streamlit as st
 import cv2
 import numpy as np
+from PIL import Image
 import os
+import time
+import glob
 
 # ==========================================
-# CONFIGURATION
+# 0. SETUP FOLDERS
 # ==========================================
-IMAGE_PATH = r"C:\Github Code\gap-solver-app\templates\Examples\Example5.png"
-GRID_SIZE = 4
+BASE_DIR = "dataset"
+LABELS = ['1circle', '2triangle', '3square', '4cross', '5star', '6question', 'blank']
+
+# Create directories if they don't exist
+os.makedirs(os.path.join(BASE_DIR, "unsorted"), exist_ok=True)
+for l in LABELS:
+    os.makedirs(os.path.join(BASE_DIR, l), exist_ok=True)
 
 # ==========================================
-# 1. ROBUST CROPPER (Edge-Based Alignment)
+# 1. SMART CROPPER (Finds the Board)
 # ==========================================
-def crop_to_grid(source_image, grid_n=GRID_SIZE):
+def smart_crop_board(image, grid_n):
     """
-    Robust Grid Cropper:
-    1. Detects edges to find the gray square 'cells'.
-    2. Filters for valid cell-like squares.
-    3. Sorts them top-to-bottom.
-    4. Picks the top N*N cells (ignoring the bottom row).
-    5. Crops to the exact bounding box of those cells.
+    Detects the puzzle board within a screenshot by finding 
+    clusters of 'cell-like' squares and cropping to their collective boundary.
     """
-    # Work on a copy
-    img = source_image.copy()
+    # 1. Standardize
+    img = image.copy()
+    h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # 1. Edge Detection (Better than thresholding for light gray boxes)
-    #    The gray boxes have a distinct edge against the white background.
-    edges = cv2.Canny(gray, 50, 150)
+    # 2. Adaptive Thresholding (The "Dark Mode" Fix)
+    # Unlike Canny, this looks for local contrast differences. 
+    # It finds faint grey lines on black backgrounds effectively.
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, 
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 
+        11, 2
+    )
+
+    # 3. Find Contours
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # 2. Find Contours
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 4. Filter for "Cell-sized" Candidates
+    # We estimate what a cell *should* look like size-wise
+    expected_cell_w = w // grid_n
+    expected_cell_h = h // grid_n
+    min_dim = expected_cell_w * 0.2  # Allow somewhat smaller (partial detection)
+    max_dim = expected_cell_w * 1.5  # Allow somewhat larger (thick borders)
     
-    valid_cells = []
-    img_h, img_w = img.shape[:2]
-    min_area = (img_w // 20) ** 2  # Dynamic min size (avoid noise)
+    valid_boxes = []
     
     for c in contours:
-        # Approximate geometric shape
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        x, y, w, h = cv2.boundingRect(approx)
-        area = w * h
-        aspect_ratio = w / float(h)
+        x, y, cw, ch = cv2.boundingRect(c)
+        aspect = cw / float(ch)
         
-        # FILTER: Look for the Grid Cells
-        # - Must have 4 corners (square-ish)
-        # - Must be a reasonable size
-        # - Must be roughly square (aspect ratio ~1.0)
-        if len(approx) == 4 and area > min_area and 0.8 < aspect_ratio < 1.2:
-            valid_cells.append((x, y, w, h))
+        # Check 1: Is it roughly square? (0.7 to 1.3 aspect ratio)
+        # Check 2: Is it within the expected size range?
+        if 0.7 < aspect < 1.3 and min_dim < cw < max_dim and min_dim < ch < max_dim:
+            valid_boxes.append((x, y, cw, ch))
+            
+    # 5. Fallback: If we didn't find enough cells, return original
+    # (Maybe the user cropped it perfectly already, or it's a weird image)
+    if len(valid_boxes) < 4: 
+        return img
 
-    # 3. Sort and Select
-    if not valid_cells:
-        print("❌ Warning: No grid cells found. Returning original.")
-        return source_image
-
-    # Sort primarily by Y (top to bottom), secondarily by X (left to right)
-    # This groups the top grid separately from the bottom row.
-    valid_cells.sort(key=lambda k: (k[1], k[0]))
+    # 6. Calculate the "Cluster" Bounding Box
+    # We find the min/max coordinates of ALL valid cells found.
+    # This effectively "snaps" to the outer grid lines.
+    min_x = min([b[0] for b in valid_boxes])
+    min_y = min([b[1] for b in valid_boxes])
+    max_x = max([b[0] + b[2] for b in valid_boxes])
+    max_y = max([b[1] + b[3] for b in valid_boxes])
     
-    # We expect N*N cells for the main grid. 
-    # Even if we detect the bottom row, we only take the top N*N.
-    expected_cells = grid_n * grid_n
-    main_grid_cells = valid_cells[:expected_cells]
-    
-    # 4. Calculate Crop Bounds based on the selected cells
-    # Find the extreme edges of just the main grid cells
-    min_x = min([c[0] for c in main_grid_cells])
-    min_y = min([c[1] for c in main_grid_cells])
-    max_x = max([c[0] + c[2] for c in main_grid_cells])
-    max_y = max([c[1] + c[3] for c in main_grid_cells])
-    
-    # Add a tiny bit of padding (optional, e.g., 5 pixels)
-    pad = 5
-    min_x = max(0, min_x - pad)
-    min_y = max(0, min_y - pad)
-    max_x = min(img_w, max_x + pad)
-    max_y = min(img_h, max_y + pad)
-
-    print(f"DEBUG: Found {len(valid_cells)} cells. Keeping top {len(main_grid_cells)}. Crop: {min_x},{min_y} to {max_x},{max_y}")
-    
-    return source_image[min_y:max_y, min_x:max_x]
+    # 7. Sanity Check
+    # If the cropped area is tiny (e.g. noise), ignore it.
+    if (max_x - min_x) < w * 0.3 or (max_y - min_y) < h * 0.3:
+        return img
+        
+    # 8. Return the Crop
+    return img[min_y:max_y, min_x:max_x]
 
 # ==========================================
-# 2. SHAPE RECOGNITION (Hierarchy & Peeling)
+# 2. HELPER: SHAPE GUESSER (For Auto-Sorting)
 # ==========================================
 def detect_shape_by_contour(cell_image):
-    # --- 1. INNER CROP (Relaxed to 10%) ---
+    # This is your old logic, just used to guess the folder name.
+    # It doesn't need to be perfect, just "good enough" to save sorting time.
     h_full, w_full = cell_image.shape[:2]
-    # Reduced margin to 10% to prevent cutting off thick cross arms
     margin_x = int(w_full * 0.15)
     margin_y = int(h_full * 0.15)
     
     roi = cell_image[margin_y:h_full-margin_y, margin_x:w_full-margin_x]
     
-    # --- Standard Pre-processing ---
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     
-    if not contours:
-        return "blank", "Empty", thresh
+    if not contours: return "blank"
 
     valid_blobs = []
     roi_h, roi_w = roi.shape[:2]
@@ -110,119 +108,177 @@ def detect_shape_by_contour(cell_image):
     for c in contours:
         area = cv2.contourArea(c)
         if area < 50: continue 
-        
-        x, y, w, h = cv2.boundingRect(c)
+        _, _, w, h = cv2.boundingRect(c)
         if w > 0.95 * roi_w or h > 0.95 * roi_h: continue
         valid_blobs.append(c)
 
-    if not valid_blobs:
-        return "blank", "Noise/Empty", thresh
+    if not valid_blobs: return "blank"
+    if len(valid_blobs) >= 2: return "6question"
 
-    # --- 2. PRIORITY CHECK: BLOB COUNT ---
-    if len(valid_blobs) >= 2:
-        return "6question", f"Blobs: {len(valid_blobs)}", thresh
-
-    # --- 3. GEOMETRY ANALYSIS ---
     largest_contour = max(valid_blobs, key=cv2.contourArea)
     area = cv2.contourArea(largest_contour)
-    
     hull = cv2.convexHull(largest_contour)
     hull_area = cv2.contourArea(hull)
     solidity = float(area)/hull_area if hull_area > 0 else 0
-    
-    x, y, w, h = cv2.boundingRect(largest_contour)
-    rect_area = w * h
-    extent = float(area) / rect_area if rect_area > 0 else 0
-    
     perimeter = cv2.arcLength(largest_contour, True)
-    # Tweak: Slightly lower epsilon (0.03) to try and catch the cross corners better
     approx = cv2.approxPolyDP(largest_contour, 0.035 * perimeter, True) 
     vertices = len(approx)
     is_convex = cv2.isContourConvex(approx)
+    _, _, w, h = cv2.boundingRect(largest_contour)
+    rect_area = w * h
+    extent = float(area) / rect_area if rect_area > 0 else 0
 
-    debug_info = f"V:{vertices} Ext:{extent:.2f} Sol:{solidity:.2f}"
-
-    # --- 4. DECISION TREE (Final Robust Version) ---
-    
-    # Logic Group A: The "Blocky" Shapes
-    # If it is Convex OR has very high solidity (like a circle)
     if is_convex or solidity > 0.92:
-        
-        # LOW EXTENT CHECK (The Fix is Here)
         if extent < 0.75:
-            # Both Triangles and "Diamond-like" Crosses land here.
-            # Differentiator: Solidity.
-            # Triangle is solid (~0.95+). Cross has armpits (~0.8).
-            if solidity > 0.9:
-                return "2triangle", debug_info, thresh
-            else:
-                return "4cross", debug_info, thresh
-        
-        # High Extent Logic
-        if vertices == 4: return "3square", debug_info, thresh
-        elif vertices == 3: return "2triangle", debug_info, thresh
-        else: return "1circle", debug_info, thresh
-
-    # Logic Group B: The "Complex" Shapes
+            if solidity > 0.9: return "2triangle"
+            else: return "4cross"
+        if vertices == 4: return "3square"
+        elif vertices == 3: return "2triangle"
+        else: return "1circle"
     else:
-        # Cross vs Question Mark
         if vertices >= 11:
-            if solidity > 0.55: return "4cross", debug_info, thresh
-            else: return "6question", debug_info, thresh
-            
-        elif 9 <= vertices <= 10:
-            return "5star", debug_info, thresh
-            
-        # Ambiguous Vertex Counts (smoothed shapes)
+            if solidity > 0.55: return "4cross"
+            else: return "6question"
+        elif 9 <= vertices <= 10: return "5star"
         else:
-            if solidity < 0.45: return "6question", debug_info, thresh
-            # If solidity is medium-high (0.6 - 0.8), it's likely a Cross or Star
-            # Star usually has lower solidity than cross due to sharp points
-            elif solidity > 0.80: return "4cross", debug_info, thresh
-            else: return "5star", debug_info, thresh
+            if solidity < 0.45: return "6question"
+            elif solidity > 0.80: return "4cross"
+            else: return "5star"
 
 # ==========================================
-# MAIN LOOP (Debugger)
+# 3. MAIN PROCESSING PIPELINE
 # ==========================================
-def main():
-    if not os.path.exists(IMAGE_PATH): return
 
-    original_img = cv2.imread(IMAGE_PATH)
+def process_single_image(cv_image, grid_size, origin_name="img"):
+    # STEP 1: Smart Crop (Finds the board inside the screenshot)
+    board_img = smart_crop_board(cv_image, grid_size)
     
-    # Pre-add border to ensure grid edges are detectable
-    bordered = cv2.copyMakeBorder(original_img, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=[255,255,255])
-    cropped_img = crop_to_grid(bordered)
+    # STEP 2: Blind Slice (Now safe to do, because board_img is tight)
+    img_h, img_w = board_img.shape[:2]
+    cell_h = img_h // grid_size
+    cell_w = img_w // grid_size
     
-    standard_size = 600
-    display_img = cv2.resize(cropped_img, (standard_size, standard_size))
+    saved_count = 0
+    timestamp = int(time.time() * 1000)
+
+    # STEP 3: Iterate & Save
+    for r in range(grid_size):
+        for c in range(grid_size):
+            y1 = r * cell_h
+            x1 = c * cell_w
+            
+            # Extract basic cell
+            cell = board_img[y1:y1+cell_h, x1:x1+cell_w]
+            
+            # Apply Safety Margin (The "15% Rule")
+            # We cut off the edges to ensure no grid lines remain
+            margin_h = int(cell_h * 0.15)
+            margin_w = int(cell_w * 0.15)
+            safe_cell = cell[margin_h : cell_h - margin_h, margin_w : cell_w - margin_w]
+            
+            # Auto-Sort Guess logic
+            try:
+                guessed_label = detect_shape_by_contour(safe_cell) 
+            except:
+                guessed_label = "unsorted"
+            
+            if guessed_label not in LABELS: guessed_label = "unsorted"
+            
+            # Filename logic
+            safe_origin = origin_name.split('.')[0][-10:]
+            filename = f"{guessed_label}_{timestamp}_{safe_origin}_{r}_{c}.png"
+            save_path = os.path.join(BASE_DIR, guessed_label, filename)
+            
+            cv2.imwrite(save_path, safe_cell)
+            saved_count += 1
+            
+    return saved_count
+
+# ==========================================
+# 4. STREAMLIT UI
+# ==========================================
+
+st.set_page_config(page_title="Batch Data Processor", layout="wide", page_icon="🏭")
+st.title("🏭 Batch Data Processor v2")
+st.markdown("Robust cropping enabled: Supports Dark Mode & messy screenshots.")
+
+with st.sidebar:
+    st.header("Settings")
+    grid_size = st.radio("Grid Size for Batch", (4, 5), index=0)
+    st.info("⚠️ Make sure all images in your batch match this grid size!")
+
+# TABS
+tab1, tab2 = st.tabs(["📂 Process Folder (Recommended)", "⬆️ Upload Files"])
+
+# --- TAB 1: LOCAL FOLDER ---
+with tab1:
+    st.write("Point to a folder on your computer containing screenshots.")
     
-    cell_h = standard_size // GRID_SIZE
-    cell_w = standard_size // GRID_SIZE
+    # Defaults to a folder named 'raw_images' in the current directory
+    default_path = os.path.join(os.getcwd(), "raw_images")
+    folder_path = st.text_input("Folder Path:", value=default_path)
+    
+    if st.button("Start Folder Batch", type="primary"):
+        if not os.path.exists(folder_path):
+            st.error("Folder not found! Please check the path.")
+        else:
+            # Find images
+            extensions = ['*.png', '*.jpg', '*.jpeg']
+            files = []
+            for ext in extensions:
+                files.extend(glob.glob(os.path.join(folder_path, ext)))
+            
+            if not files:
+                st.warning("No images found in that folder.")
+            else:
+                st.write(f"Found {len(files)} images. Processing...")
+                
+                # Progress Bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                total_cells = 0
+                
+                for i, file_path in enumerate(files):
+                    img = cv2.imread(file_path)
+                    if img is not None:
+                        f_name = os.path.basename(file_path)
+                        count = process_single_image(img, grid_size, f_name)
+                        total_cells += count
+                    
+                    # Update Progress
+                    progress = (i + 1) / len(files)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Processed {i+1}/{len(files)}: {os.path.basename(file_path)}")
+                
+                st.success(f"🎉 Batch Complete! Extracted {total_cells} cells into '{BASE_DIR}'.")
+                st.balloons()
 
-    for r in range(GRID_SIZE):
-        for c in range(GRID_SIZE):
-            y1, y2 = r * cell_h, (r + 1) * cell_h
-            x1, x2 = c * cell_w, (c + 1) * cell_w
+# --- TAB 2: UPLOAD FILES ---
+with tab2:
+    st.write("Drag and drop multiple files here.")
+    uploaded_files = st.file_uploader("Upload Screenshots", accept_multiple_files=True, type=['png', 'jpg'])
+    
+    if uploaded_files and st.button("Process Uploaded Files"):
+        progress_bar = st.progress(0)
+        total_cells = 0
+        
+        for i, uploaded_file in enumerate(uploaded_files):
+            # Convert uploaded file to OpenCV format
+            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+            img = cv2.imdecode(file_bytes, 1)
             
-            m = 6 # Small margin to clear the grid lines themselves
-            cell_roi = display_img[y1+m:y2-m, x1+m:x2-m]
+            count = process_single_image(img, grid_size, uploaded_file.name)
+            total_cells += count
             
-            label, stats, debug_mask = detect_shape_by_contour(cell_roi)
+            progress_bar.progress((i + 1) / len(uploaded_files))
             
-            view = display_img.copy()
-            cv2.rectangle(view, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(view, f"Pred: {label}", (10, 30), 1, 1.5, (0,0,255), 2)
-            cv2.putText(view, stats, (10, 60), 1, 1.2, (255,0,0), 2)
+        st.success(f"Done! Saved {total_cells} cells.")
 
-            roi_zoom = cv2.resize(cell_roi, (300, 300))
-            mask_zoom = cv2.resize(debug_mask, (300, 300))
-            mask_zoom_bgr = cv2.cvtColor(mask_zoom, cv2.COLOR_GRAY2BGR)
-            
-            cv2.imshow("Debugger", np.hstack((roi_zoom, mask_zoom_bgr)))
-            cv2.imshow("Full Grid Alignment", view)
-            
-            if cv2.waitKey(0) == ord('q'): break
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
+# --- STATS ---
+st.markdown("---")
+st.subheader("Dataset Statistics")
+cols = st.columns(len(LABELS))
+for i, l in enumerate(LABELS):
+    path = os.path.join(BASE_DIR, l)
+    count = len(os.listdir(path))
+    cols[i].metric(l, count)

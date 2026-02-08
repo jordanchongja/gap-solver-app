@@ -2,328 +2,298 @@ import streamlit as st
 from streamlit_paste_button import paste_image_button as pbutton
 import cv2
 import numpy as np
-from PIL import Image
+import joblib
+import os
+import time
+
+# Import your robust preprocessor
+# (Ensure preprocess.py is in the same folder)
+from preprocess import standardize_cell
 
 # ==========================================
-# 1. CORE LOGIC (Image Processing)
+# 1. PAGE & SESSION SETUP
 # ==========================================
+st.set_page_config(page_title="Gap Solver AI", layout="wide", page_icon="🧩")
 
-def crop_to_grid(source_image, grid_n):
-    img = source_image.copy()
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    valid_cells = []
-    img_h, img_w = img.shape[:2]
-    min_area = (img_w // 20) ** 2 
-    
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        x, y, w, h = cv2.boundingRect(approx)
-        area = w * h
-        aspect_ratio = w / float(h)
-        
-        if len(approx) == 4 and area > min_area and 0.8 < aspect_ratio < 1.2:
-            valid_cells.append((x, y, w, h))
+if 'grid_data' not in st.session_state: st.session_state.grid_data = None
+if 'last_paste_id' not in st.session_state: st.session_state.last_paste_id = 0
 
-    if not valid_cells:
-        return source_image
-
-    valid_cells.sort(key=lambda k: (k[1], k[0]))
-    expected_cells = grid_n * grid_n
-    main_grid_cells = valid_cells[:expected_cells]
-    
-    if not main_grid_cells:
-        return source_image
-
-    min_x = min([c[0] for c in main_grid_cells])
-    min_y = min([c[1] for c in main_grid_cells])
-    max_x = max([c[0] + c[2] for c in main_grid_cells])
-    max_y = max([c[1] + c[3] for c in main_grid_cells])
-    
-    pad = 5
-    min_x = max(0, min_x - pad)
-    min_y = max(0, min_y - pad)
-    max_x = min(img_w, max_x + pad)
-    max_y = min(img_h, max_y + pad)
-    
-    return source_image[min_y:max_y, min_x:max_x]
-
-def detect_shape_by_contour(cell_image):
-    h_full, w_full = cell_image.shape[:2]
-    margin_x = int(w_full * 0.15)
-    margin_y = int(h_full * 0.15)
-    
-    roi = cell_image[margin_y:h_full-margin_y, margin_x:w_full-margin_x]
-    
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return "blank"
-
-    valid_blobs = []
-    roi_h, roi_w = roi.shape[:2]
-    
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < 50: continue 
-        _, _, w, h = cv2.boundingRect(c)
-        if w > 0.95 * roi_w or h > 0.95 * roi_h: continue
-        valid_blobs.append(c)
-
-    if not valid_blobs:
-        return "blank"
-
-    if len(valid_blobs) >= 2:
-        return "6question"
-
-    largest_contour = max(valid_blobs, key=cv2.contourArea)
-    area = cv2.contourArea(largest_contour)
-    hull = cv2.convexHull(largest_contour)
-    hull_area = cv2.contourArea(hull)
-    solidity = float(area)/hull_area if hull_area > 0 else 0
-    
-    perimeter = cv2.arcLength(largest_contour, True)
-    approx = cv2.approxPolyDP(largest_contour, 0.035 * perimeter, True) 
-    vertices = len(approx)
-    is_convex = cv2.isContourConvex(approx)
-    
-    _, _, w, h = cv2.boundingRect(largest_contour)
-    rect_area = w * h
-    extent = float(area) / rect_area if rect_area > 0 else 0
-
-    if is_convex or solidity > 0.92:
-        if extent < 0.75:
-            if solidity > 0.9: return "2triangle"
-            else: return "4cross"
-        if vertices == 4: return "3square"
-        elif vertices == 3: return "2triangle"
-        else: return "1circle"
-    else:
-        if vertices >= 11:
-            if solidity > 0.55: return "4cross"
-            else: return "6question"
-        elif 9 <= vertices <= 10:
-            return "5star"
-        else:
-            if solidity < 0.45: return "6question"
-            elif solidity > 0.80: return "4cross"
-            else: return "5star"
-
-def process_full_image(pil_image, grid_size):
-    open_cv_image = np.array(pil_image.convert('RGB')) 
-    open_cv_image = open_cv_image[:, :, ::-1].copy() 
-
-    cropped = crop_to_grid(open_cv_image, grid_size)
-
-    standard_size = 600
-    display_img = cv2.resize(cropped, (standard_size, standard_size))
-    
-    cell_h = standard_size // grid_size
-    cell_w = standard_size // grid_size
-
-    detected_grid = []
-    
-    for r in range(grid_size):
-        row_data = []
-        for c in range(grid_size):
-            y1, y2 = r * cell_h, (r + 1) * cell_h
-            x1, x2 = c * cell_w, (c + 1) * cell_w
-            m = 6
-            cell_roi = display_img[y1+m:y2-m, x1+m:x2-m]
-            label = detect_shape_by_contour(cell_roi)
-            row_data.append(label)
-        detected_grid.append(row_data)
-        
-    return detected_grid, cropped
+# Callback to clear state explicitly (extra safety)
+def clear_grid_state():
+    st.session_state.grid_data = None
+    st.session_state.last_paste_id = 0
 
 # ==========================================
-# 2. SOLVER LOGIC (Robust)
+# 2. HELPER FUNCTIONS
 # ==========================================
-
-def find_empty(board):
-    for r in range(len(board)):
-        for c in range(len(board[0])):
-            if board[r][c] == 'blank':
-                return (r, c)
+@st.cache_resource
+def load_model():
+    if os.path.exists("model.pkl"):
+        return joblib.load("model.pkl")
     return None
 
-def solve_with_backtracking(board, all_shapes):
+def smart_crop_board(image, grid_n):
+    img = image.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    expected_w = img.shape[1] // grid_n
+    valid_boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if 0.7 < w/h < 1.3 and expected_w*0.2 < w < expected_w*1.5:
+            valid_boxes.append((x,y,w,h))
+            
+    if len(valid_boxes) < 4: return img
+    
+    min_x = min([b[0] for b in valid_boxes])
+    min_y = min([b[1] for b in valid_boxes])
+    max_x = max([b[0]+b[2] for b in valid_boxes])
+    max_y = max([b[1]+b[3] for b in valid_boxes])
+    
+    if (max_x - min_x) < img.shape[1] * 0.2: return img
+    
+    return img[min_y:max_y, min_x:max_x]
+
+def predict_grid_labels(image, grid_size, clf):
+    # 1. Find Board
+    board = smart_crop_board(image, grid_size)
+    
+    h, w = board.shape[:2]
+    cell_h, cell_w = h // grid_size, w // grid_size
+    
+    batch_features = []
+    
+    for r in range(grid_size):
+        for c in range(grid_size):
+            y1, x1 = r*cell_h, c*cell_w
+            m_h = int(cell_h * 0.05)
+            m_w = int(cell_w * 0.05)
+            
+            raw_cell = board[y1:y1+cell_h, x1:x1+cell_w]
+            safe_cell = raw_cell[m_h:cell_h-m_h, m_w:cell_w-m_w]
+            
+            clean = standardize_cell(safe_cell)
+            feat = clean.flatten() / 255.0
+            batch_features.append(feat)
+            
+    if not batch_features: return [], board
+    
+    predictions = clf.predict(np.array(batch_features))
+    
+    grid_matrix = []
+    idx = 0
+    for r in range(grid_size):
+        row = []
+        for c in range(grid_size):
+            row.append(predictions[idx])
+            idx += 1
+        grid_matrix.append(row)
+        
+    return grid_matrix, board
+
+# ==========================================
+# 3. SOLVER LOGIC
+# ==========================================
+def solve_backtracking(board, shapes):
+    def find_empty(b):
+        for r in range(len(b)):
+            for c in range(len(b[0])):
+                if b[r][c] == 'blank': return (r, c)
+        return None
+
+    def is_valid(b, s, pos):
+        # Row check
+        for i in range(len(b[0])):
+            if b[pos[0]][i] == s and pos[1] != i: return False
+        # Col check
+        for i in range(len(b)):
+            if b[i][pos[1]] == s and pos[0] != i: return False
+        return True
+
     find = find_empty(board)
     if not find: return True
     row, col = find
-    
-    row_vals = board[row]
-    col_vals = [board[i][col] for i in range(len(board))]
-    
-    for shape in all_shapes:
-        if shape in row_vals or shape in col_vals: continue
-        
-        board[row][col] = shape
-        if solve_with_backtracking(board, all_shapes): return True
-        board[row][col] = 'blank'
-        
+
+    for shape in shapes:
+        if is_valid(board, shape, (row, col)):
+            board[row][col] = shape
+            if solve_backtracking(board, shapes): return True
+            board[row][col] = 'blank'
+            
     return False
 
-def run_solver(grid_data, grid_size):
+def run_solver_logic(grid_data):
+    if not grid_data: return "No Data", None
     board_copy = [row[:] for row in grid_data]
+    current_grid_size = len(board_copy)
     
-    # 1. Identify Existing Shapes
     present_shapes = set()
     question_pos = None
     
-    for r in range(len(board_copy)):
-        for c in range(len(board_copy[0])):
+    for r in range(current_grid_size):
+        for c in range(current_grid_size):
             val = board_copy[r][c]
             if val == '6question':
                 question_pos = (r, c)
+                board_copy[r][c] = 'blank'
             elif val != 'blank':
                 present_shapes.add(val)
-    
-    if not question_pos:
-        return "No '6question' found!", None
-    
-    # 2. Force Universe Size == Grid Size
-    # If the puzzle is sparse, we might only see 3 shapes in a 4x4 grid.
-    # We MUST inject shapes to make the universe length equal to grid_size.
-    universe = list(present_shapes)
-    
-    # Priority list of shapes to add if we are missing some
+                
+    if not question_pos: return "No '?' found!", None
+        
+    universe = sorted(list(present_shapes))
     standard_shapes = ['1circle', '2triangle', '3square', '4cross', '5star']
     
-    for shape in standard_shapes:
-        if len(universe) >= grid_size:
-            break
-        if shape not in universe:
-            universe.append(shape)
-            
-    # Sort for consistency
+    for s in standard_shapes:
+        if len(universe) >= current_grid_size: break
+        if s not in universe: universe.append(s)
     universe.sort()
     
-    # Debug info for user
-    # st.write(f"DEBUG: Solving with universe: {universe}")
-
-    qr, qc = question_pos
-    board_copy[qr][qc] = 'blank' 
-    
-    success = solve_with_backtracking(board_copy, universe)
+    success = solve_backtracking(board_copy, universe)
     
     if success:
+        qr, qc = question_pos
         return board_copy[qr][qc], board_copy
-    else:
-        return "Unsolvable", None
+    return "Unsolvable", None
 
 # ==========================================
-# 3. STREAMLIT UI
+# 4. SIDEBAR & CONFIG
 # ==========================================
-
-st.set_page_config(page_title="Gap Solver", layout="wide", page_icon="🧩")
-st.title("🧩 Gap Challenge Solver")
-
-# Initialize Session State Variables
-if 'paste_id' not in st.session_state: st.session_state.paste_id = 0
-
 with st.sidebar:
-    st.header("Settings")
-    grid_size = st.radio("Grid Size", (4, 5), index=0)
-    st.markdown("---")
-    if st.button("Reset / Clear All"):
-        st.session_state.clear()
+    st.header("⚙️ Settings")
+    
+    # 1. RESET BUTTON
+    if st.button("🗑️ Reset / Clear All", type="secondary"):
+        clear_grid_state()
         st.rerun()
 
-col1, col2 = st.columns([1, 1])
+    st.markdown("---")
+    
+    # 2. GRID SIZE (With Callback)
+    grid_size = st.radio(
+        "Grid Size", 
+        (4, 5), 
+        index=0, 
+        on_change=clear_grid_state
+    )
+    
+    st.markdown("---")
+    model_data = load_model()
+    if model_data:
+        st.success("✅ Brain Loaded")
+    else:
+        st.error("❌ Brain Missing")
 
-# --- COL 1: INPUT ---
+# ==========================================
+# 5. MAIN UI
+# ==========================================
+st.title("🧩 Gap Challenge Auto-Solver")
+
+col1, col2 = st.columns([1, 1.2])
+
+# --- LEFT COLUMN: INPUT ---
 with col1:
-    st.subheader("1. Input Puzzle")
-    # Paste button logic
-    paste_result = pbutton("📋 Paste Image", key="paste_btn")
+    st.subheader("1. Input")
+    
+    # KEY TRICK: We attach grid_size to the key.
+    # When grid_size changes, this becomes a "new" button, resetting the paste state entirely.
+    paste_result = pbutton("📋 Paste Image", key=f"paste_btn_{grid_size}")
     
     if paste_result.image_data is not None:
-        # Check if this is a NEW paste or the same one
-        if 'last_image_data' not in st.session_state or \
-           st.session_state.last_image_data != paste_result.image_data:
+        # Generate unique ID for this paste
+        current_paste_id = hash(paste_result.image_data.tobytes())
+        
+        # New Paste Logic
+        if current_paste_id != st.session_state.last_paste_id or st.session_state.grid_data is None:
+            st.session_state.last_paste_id = current_paste_id
             
-            # 1. UPDATE IMAGE STATE
-            st.session_state.last_image_data = paste_result.image_data
+            with st.spinner(f"Solving {grid_size}x{grid_size}..."):
+                # Convert to BGR for OpenCV
+                img_array = np.array(paste_result.image_data.convert('RGB'))[:, :, ::-1]
+                
+                if model_data:
+                    clf = model_data['model']
+                    preds, cropped_bgr = predict_grid_labels(img_array, grid_size, clf)
+                    
+                    st.session_state.grid_data = preds
+                    # Save RGB version for display (Fixes Color Shift)
+                    st.session_state.cropped_view = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
+                else:
+                    st.warning("Train model first.")
+                    
+        # Display the RGB view
+        if 'cropped_view' in st.session_state:
+            # Use 'use_container_width' to fix deprecation warning
+            st.image(st.session_state.cropped_view, caption="Detected Board", use_container_width=True)
+        else:
+            st.image(paste_result.image_data, caption="Raw Paste", use_container_width=True)
             
-            # 2. INCREMENT PASTE ID (This forces the grid editor to reset)
-            st.session_state.paste_id += 1 
-            
-            # 3. PROCESS IMMEDIATELY
-            with st.spinner("Analyzing..."):
-                detected_grid, cropped_cv = process_full_image(paste_result.image_data, grid_size)
-                st.session_state.grid_data = detected_grid
-                st.session_state.cropped_view = cropped_cv
-                st.rerun()
-
-        st.image(paste_result.image_data, caption="Current Image", use_column_width=True)
     else:
-        st.info("Win+Shift+S (Windows) or Cmd+Shift+4 (Mac) to screenshot.")
+        st.info(f"Paste a {grid_size}x{grid_size} screenshot to begin.")
 
-# --- COL 2: EDIT & SOLVE ---
+# --- RIGHT COLUMN: EDITOR & SOLUTION ---
 with col2:
     st.subheader("2. Verify & Solve")
     
-    if 'grid_data' in st.session_state and st.session_state.grid_data is not None:
-        st.write("Edit any errors below:")
+    # Render only if valid data exists
+    if st.session_state.grid_data and len(st.session_state.grid_data) == grid_size:
         
-        shape_options = ['blank', '1circle', '2triangle', '3square', '4cross', '5star', '6question']
+        shape_options = sorted(model_data['classes']) if model_data else ['1circle', '2triangle', '3square', '4cross', '5star']
+        if 'blank' not in shape_options: shape_options.insert(0, 'blank')
+        if '6question' not in shape_options: shape_options.append('6question')
+
+        updated_grid = []
         
-        # We append paste_id to the form key. 
-        # When paste_id changes, Streamlit sees this as a BRAND NEW form 
-        # and discards the old state, effectively resetting the dropdowns.
-        with st.form(key=f"grid_editor_form_{st.session_state.paste_id}"):
-            current_rows = st.session_state.grid_data
-            updated_grid = []
+        # Grid Editor
+        for r in range(grid_size):
+            cols = st.columns(grid_size)
+            row_data = []
+            for c in range(grid_size):
+                val = st.session_state.grid_data[r][c]
+                # Include paste ID in key to force reset on new image
+                new_val = cols[c].selectbox(
+                    label=f"({r},{c})",
+                    options=shape_options,
+                    index=shape_options.index(val) if val in shape_options else 0,
+                    key=f"c_{r}_{c}_{st.session_state.last_paste_id}",
+                    label_visibility="collapsed"
+                )
+                row_data.append(new_val)
+            updated_grid.append(row_data)
+        
+        st.session_state.grid_data = updated_grid
+        
+        # Auto-Solve
+        st.markdown("---")
+        result, final_board = run_solver_logic(updated_grid)
+        
+        if final_board:
+            clean_name = str(result).replace("1","").replace("2","").replace("3","").replace("4","").replace("5","").replace("6","").upper()
+            st.success(f"### Missing Shape: {clean_name}")
+            with st.expander("View Full Solution Grid"):
+                st.table(final_board)
+        else:
+            st.error(f"Status: {result}")
+            st.warning("Check grid for errors.")
             
-            for r in range(grid_size):
-                cols = st.columns(grid_size)
-                row_data = []
-                for c in range(grid_size):
-                    val = current_rows[r][c]
-                    if val not in shape_options: val = 'blank'
-                    
-                    # Key includes paste_id to ensure freshness on new paste
-                    user_val = cols[c].selectbox(
-                        label="cell",
-                        options=shape_options,
-                        index=shape_options.index(val),
-                        key=f"c_{r}_{c}_{st.session_state.paste_id}",
-                        label_visibility="collapsed"
-                    )
-                    row_data.append(user_val)
-                updated_grid.append(row_data)
-            
-            st.markdown("---")
-            solve_btn = st.form_submit_button("✅ Solve Updated Grid", type="primary")
+    elif st.session_state.grid_data:
+        # Fallback if state gets messy
+        st.warning("State mismatch. Click Reset.")
 
-        if solve_btn:
-            missing_shape, final_grid = run_solver(updated_grid, grid_size)
-            
-            if final_grid:
-                st.success("Solution Found!")
-                clean_name = str(missing_shape).replace("1","").replace("2","").replace("3","").replace("4","").replace("5","").replace("6","").upper()
-                st.metric(label="The missing shape is:", value=clean_name)
-                
-                with st.expander("View Solution Grid"):
-                    st.table(final_grid)
-            else:
-                st.error(f"Status: {missing_shape}")
-                st.warning("Check your grid. Ensure you have exactly one '?' and no duplicate shapes in any row/col.")
-
-# --- INSTRUCTIONS ---
+# ==========================================
+# 6. HELP
+# ==========================================
 st.markdown("---")
-with st.expander("ℹ️ Help"):
+with st.expander("ℹ️ How it works"):
     st.markdown("""
-    **Tips:**
-    * **Auto-Reset:** Pasting a new image automatically resets the grid.
-    * **Missing Shapes:** If the puzzle is sparse (e.g. only stars and crosses are visible), the solver will assume standard shapes (Circles, Squares) fill the gaps.
+    **Gap Challenge Solver**
+    1.  **Select Grid Size:** Toggle between 4x4 and 5x5. This will clear the current board.
+    2.  **Paste Image:** Screenshot the puzzle. The app detects the board, fixes colors, and centers shapes automatically.
+    3.  **Review:** If the AI mistakes a shape, correct it in the dropdowns.
+    4.  **Solve:** The answer updates instantly below.
     """)

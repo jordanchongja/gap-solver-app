@@ -5,3 +5,9 @@ xx) archive/
 __pycache__/
 *.pyc
 .streamlit/
+*.pkl
+*.png
+dataset\
+examples\
+new_dataset\
+templates\
