@@ -28,8 +28,8 @@ def clear_grid_state():
 # ==========================================
 @st.cache_resource
 def load_model():
-    if os.path.exists("C:\Github Code\gap-solver-app\phase3-SVM\model.pkl"):
-        return joblib.load("C:\Github Code\gap-solver-app\phase3-SVM\model.pkl")
+    if os.path.exists("model.pkl"):
+        return joblib.load("model.pkl")
     return None
 
 def smart_crop_board(image, grid_n):
